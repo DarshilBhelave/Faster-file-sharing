@@ -1,21 +1,24 @@
 package com.warpshare.app
 
+import android.annotation.SuppressLint
 import android.app.*
-import android.bluetooth.BluetoothAdapter
 import android.bluetooth.BluetoothManager
 import android.bluetooth.le.*
 import android.content.Context
 import android.content.Intent
+import android.content.pm.ServiceInfo
 import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.IBinder
 import android.os.ParcelUuid
+import android.provider.Settings
 import kotlinx.coroutines.*
 import java.net.DatagramPacket
 import java.net.DatagramSocket
 import java.net.InetAddress
 import java.util.UUID
 
+@SuppressLint("MissingPermission")
 class RadioWakeService : Service() {
 
     companion object {
@@ -28,7 +31,6 @@ class RadioWakeService : Service() {
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
     private var wifiLock: WifiManager.WifiLock? = null
     private var bleScanner: BluetoothLeScanner? = null
-    private var bleAdvertiser: BluetoothLeAdvertiser? = null
 
     override fun onCreate() {
         super.onCreate()
@@ -39,50 +41,45 @@ class RadioWakeService : Service() {
     }
 
     /**
-     * SILENT RADIO AUTO-TOGGLE (Works automatically via targetSdk 28!)
+     * Checks Wi-Fi state; on Android 16 pops up the instant 1-tap Wi-Fi panel if Wi-Fi is off
      */
-    @Suppress("DEPRECATION")
-    fun forceTurnOnRadios(context: Context) {
+    fun ensureWifiReady(context: Context) {
         val wifiManager = context.applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
         if (!wifiManager.isWifiEnabled) {
-            wifiManager.isWifiEnabled = true
-            onStatusUpdate?.invoke("Wi-Fi automatically turned ON!")
-        }
-
-        val btManager = context.getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager
-        val btAdapter = btManager.adapter
-        if (btAdapter != null && !btAdapter.isEnabled) {
-            btAdapter.enable()
-            onStatusUpdate?.invoke("Bluetooth automatically turned ON!")
+            onStatusUpdate?.invoke("Wake signal received! Turning on Wi-Fi...")
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                val panelIntent = Intent(Settings.Panel.ACTION_WIFI).apply {
+                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                }
+                context.startActivity(panelIntent)
+            } else {
+                @Suppress("DEPRECATION")
+                wifiManager.isWifiEnabled = true
+            }
         }
     }
 
-    /**
-     * Forces the Wi-Fi chip into 100% duty cycle (zero power-save lag)
-     */
     private fun acquireHighSpeedWifiLock() {
-        val wifiManager = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
-        val lockMode = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            WifiManager.WIFI_MODE_FULL_LOW_LATENCY
-        } else {
-            @Suppress("DEPRECATION")
-            WifiManager.WIFI_MODE_FULL_HIGH_PERF
-        }
-        wifiLock = wifiManager.createWifiLock(lockMode, "WarpShare:SuperSpeedLock").apply {
-            setReferenceCounted(false)
-            acquire()
-        }
+        try {
+            val wifiManager = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
+            val lockMode = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                WifiManager.WIFI_MODE_FULL_LOW_LATENCY
+            } else {
+                @Suppress("DEPRECATION")
+                WifiManager.WIFI_MODE_FULL_HIGH_PERF
+            }
+            wifiLock = wifiManager.createWifiLock(lockMode, "WarpShare:SuperSpeedLock").apply {
+                setReferenceCounted(false)
+                acquire()
+            }
+        } catch (_: Exception) {}
     }
 
-    /**
-     * TABLET: Listens for a tiny BLE wake packet from the phone.
-     * As soon as it hears it, it turns on Wi-Fi automatically!
-     */
     private fun startBleWakeListener() {
         try {
             val btManager = getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager
             val adapter = btManager.adapter ?: return
-            if (!adapter.isEnabled) adapter.enable()
+            if (!adapter.isEnabled) return
 
             bleScanner = adapter.bluetoothLeScanner ?: return
             val filter = ScanFilter.Builder()
@@ -93,28 +90,20 @@ class RadioWakeService : Service() {
                 .build()
 
             bleScanner?.startScan(listOf(filter), settings, scanCallback)
-        } catch (e: Exception) {
-            onStatusUpdate?.invoke("BLE Listener ready: ${e.message}")
-        }
+        } catch (_: Exception) {}
     }
 
     private val scanCallback = object : ScanCallback() {
         override fun onScanResult(callbackType: Int, result: ScanResult?) {
-            // Wake signal detected from Phone! Turn on Wi-Fi immediately!
-            forceTurnOnRadios(this@RadioWakeService)
-            // Stop BLE scan immediately so 2.4GHz antenna doesn't interfere with Wi-Fi transfer
+            ensureWifiReady(this@RadioWakeService)
             try { bleScanner?.stopScan(this) } catch (_: Exception) {}
         }
     }
 
-    /**
-     * PHONE: Broadcasts a 2-second BLE Wake-Up pulse to wake the Tablet's Wi-Fi,
-     * then stops Bluetooth immediately to prevent antenna interference.
-     */
     fun sendBleWakePulse(context: Context) {
         scope.launch {
             try {
-                forceTurnOnRadios(context)
+                ensureWifiReady(context)
                 val btManager = context.getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager
                 val advertiser = btManager.adapter?.bluetoothLeAdvertiser
                 if (advertiser != null) {
@@ -128,17 +117,14 @@ class RadioWakeService : Service() {
                         .build()
                     val callback = object : AdvertiseCallback() {}
                     advertiser.startAdvertising(settings, data, callback)
-                    onStatusUpdate?.invoke("Sent BLE Wake Pulse to Tablet...")
-                    delay(1800) // Pulse for 1.8s then silence BT radio for max Wi-Fi speed
+                    onStatusUpdate?.invoke("Sent BLE Wake Pulse! Stopping BT to prevent interference...")
+                    delay(1500)
                     advertiser.stopAdvertising(callback)
                 }
             } catch (_: Exception) {}
         }
     }
 
-    /**
-     * Zero-Config Auto IP Discovery over Wi-Fi (No manual typing needed!)
-     */
     private fun startUdpAutoDiscoveryResponder() {
         scope.launch {
             try {
@@ -175,7 +161,7 @@ class RadioWakeService : Service() {
                     )
                     repeat(3) {
                         socket.send(packet)
-                        delay(300)
+                        delay(250)
                     }
                 }
             } catch (_: Exception) {}
@@ -192,18 +178,22 @@ class RadioWakeService : Service() {
         }
         val notification = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             Notification.Builder(this, channelId)
-                .setContentTitle("WarpShare Ready")
-                .setContentText("Listening for instant BLE wake & 8-stream transfers")
+                .setContentTitle("WarpShare 8-Stream Active")
+                .setContentText("High-Speed 5GHz Low-Latency Lock Enabled")
                 .setSmallIcon(android.R.drawable.stat_sys_upload_done)
                 .build()
         } else {
             @Suppress("DEPRECATION")
             Notification.Builder(this)
-                .setContentTitle("WarpShare Ready")
+                .setContentTitle("WarpShare Active")
                 .setSmallIcon(android.R.drawable.stat_sys_upload_done)
                 .build()
         }
-        startForeground(1, notification)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+            startForeground(1, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
+        } else {
+            startForeground(1, notification)
+        }
     }
 
     override fun onDestroy() {
