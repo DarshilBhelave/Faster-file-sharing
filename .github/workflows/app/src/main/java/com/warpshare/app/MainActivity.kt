@@ -2,6 +2,7 @@ package com.warpshare.app
 
 import android.Manifest
 import android.app.Activity
+import android.content.Context
 import android.content.Intent
 import android.graphics.Color
 import android.graphics.Typeface
@@ -26,31 +27,39 @@ class MainActivity : Activity() {
     private lateinit var progressBar: ProgressBar
     private lateinit var ipInput: EditText
     private val serviceHelper = RadioWakeService()
+    private var isReceiving = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        // Request permissions on launch
-        requestPermissions(
-            arrayOf(
-                Manifest.permission.ACCESS_FINE_LOCATION,
-                Manifest.permission.WRITE_EXTERNAL_STORAGE,
-                Manifest.permission.READ_EXTERNAL_STORAGE
-            ), 100
+        // Request Android 12 - 16 Nearby & Bluetooth permissions
+        val perms = mutableListOf(
+            Manifest.permission.ACCESS_FINE_LOCATION,
+            Manifest.permission.ACCESS_COARSE_LOCATION
         )
-
-        // Start Background Auto-Wake & Low-Latency Service
-        val svcIntent = Intent(this, RadioWakeService::class.java)
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            startForegroundService(svcIntent)
-        } else {
-            startService(svcIntent)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            perms.add(Manifest.permission.BLUETOOTH_SCAN)
+            perms.add(Manifest.permission.BLUETOOTH_ADVERTISE)
+            perms.add(Manifest.permission.BLUETOOTH_CONNECT)
         }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            perms.add(Manifest.permission.NEARBY_WIFI_DEVICES)
+            perms.add(Manifest.permission.POST_NOTIFICATIONS)
+        }
+        requestPermissions(perms.toTypedArray(), 100)
 
-        // Automatically turn on Wi-Fi & BT on launch
-        serviceHelper.forceTurnOnRadios(this)
+        // Start Background Service safely
+        try {
+            val svcIntent = Intent(this, RadioWakeService::class.java)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                startForegroundService(svcIntent)
+            } else {
+                startService(svcIntent)
+            }
+        } catch (_: Exception) {}
 
-        // Build clean programmatic UI (No XML files needed!)
+        val prefs = getSharedPreferences("warp_prefs", Context.MODE_PRIVATE)
+
         val layout = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(48, 64, 48, 48)
@@ -59,52 +68,56 @@ class MainActivity : Activity() {
         }
 
         val title = TextView(this).apply {
-            text = "⚡ WARPSHARE 8-STREAM"
-            textSize = 24f
+            text = "⚡ WARPSHARE v2.0 (8-STREAM)"
+            textSize = 22f
             setTypeface(null, Typeface.BOLD)
             setTextColor(Color.parseColor("#38BDF8"))
         }
 
-        val myIp = getLocalIpAddress()
         val ipBanner = TextView(this).apply {
-            text = "This Device IP: $myIp"
-            textSize = 15f
-            setTextColor(Color.parseColor("#94A3B8"))
-            setPadding(0, 12, 0, 32)
+            text = "This Device IP: ${getLocalIpAddress()}"
+            textSize = 16f
+            setTypeface(null, Typeface.BOLD)
+            setTextColor(Color.parseColor("#FACC15"))
+            setPadding(0, 16, 0, 24)
         }
 
         ipInput = EditText(this).apply {
-            hint = "Tablet IP (Auto-filled or type here)"
+            hint = "Enter or Auto-Find Tablet IP"
+            setText(prefs.getString("saved_ip", ""))
             setHintTextColor(Color.parseColor("#64748B"))
             setTextColor(Color.WHITE)
             textSize = 16f
         }
 
         val btnAutoDiscover = Button(this).apply {
-            text = "1. Wake Tablet (BLE) & Auto-Find IP"
+            text = "🔍 1. Wake Tablet (BLE) & Auto-Find IP"
             setOnClickListener {
-                statusText.text = "Sending BLE Wake Pulse & searching..."
+                statusText.text = "Sending BLE Wake Pulse & searching network..."
                 serviceHelper.sendBleWakePulse(this@MainActivity)
                 serviceHelper.broadcastFindTablet()
             }
         }
 
         val btnReceiveMode = Button(this).apply {
-            text = "TABLET MODE: Start 8-Stream Receiver"
+            text = "📥 TABLET MODE: Start Always-On Receiver"
             setOnClickListener { startTabletReceiver() }
         }
 
         val btnPickAndSend = Button(this).apply {
-            text = "PHONE MODE: Pick File & Blast (8 Streams)"
-            setOnClickListener { pickFile() }
+            text = "🚀 PHONE MODE: Pick File & Blast (8 Streams)"
+            setOnClickListener {
+                prefs.edit().putString("saved_ip", ipInput.text.toString().trim()).apply()
+                pickFile()
+            }
         }
 
         speedText = TextView(this).apply {
             text = "0.0 MB/s"
-            textSize = 32f
+            textSize = 36f
             setTypeface(null, Typeface.BOLD)
             setTextColor(Color.parseColor("#4ADE80"))
-            setPadding(0, 40, 0, 16)
+            setPadding(0, 36, 0, 16)
         }
 
         progressBar = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply {
@@ -113,7 +126,7 @@ class MainActivity : Activity() {
         }
 
         statusText = TextView(this).apply {
-            text = "Ready. Tap 'Start Receiver' on Tablet, or Share any file from Phone."
+            text = "Tip: Connect both devices to the same Wi-Fi or Phone Hotspot."
             textSize = 14f
             setTextColor(Color.parseColor("#E2E8F0"))
             setPadding(0, 24, 0, 0)
@@ -136,13 +149,19 @@ class MainActivity : Activity() {
         RadioWakeService.onTabletIpFound = { foundIp ->
             runOnUiThread {
                 ipInput.setText(foundIp)
-                statusText.text = "Found Tablet at $foundIp!"
+                prefs.edit().putString("saved_ip", foundIp).apply()
+                statusText.text = "✅ Auto-Found Tablet at $foundIp!"
             }
         }
 
-        // Check if user launched WarpShare directly from Android's Share Sheet
+        // Handle 1-Tap Share from Android Gallery / File Manager
         if (intent?.action == Intent.ACTION_SEND) {
-            val sharedUri = intent.getParcelableExtra<Uri>(Intent.EXTRA_STREAM)
+            val sharedUri = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                intent.getParcelableExtra(Intent.EXTRA_STREAM, Uri::class.java)
+            } else {
+                @Suppress("DEPRECATION")
+                intent.getParcelableExtra(Intent.EXTRA_STREAM)
+            }
             if (sharedUri != null) {
                 serviceHelper.sendBleWakePulse(this)
                 handleSendUri(sharedUri)
@@ -151,26 +170,34 @@ class MainActivity : Activity() {
     }
 
     private fun startTabletReceiver() {
-        statusText.text = "Listening on Port 9500 (8 Zero-Copy Streams Ready)..."
+        if (isReceiving) return
+        isReceiving = true
+        statusText.text = "🟢 Always-On Receiver Active (Port 9500)..."
         scope.launch {
-            try {
-                val downloads = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
-                val savedFile = WarpEngine.receiveFile(downloads) { name, speed, pct ->
-                    runOnUiThread {
-                        speedText.text = String.format("%.1f MB/s", speed)
-                        progressBar.progress = pct
-                        statusText.text = "Receiving $name ($pct%)"
+            while (isActive) {
+                try {
+                    val downloads = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
+                    val savedFile = WarpEngine.receiveFile(downloads) { name, speed, pct ->
+                        runOnUiThread {
+                            speedText.text = String.format("%.1f MB/s", speed)
+                            progressBar.progress = pct
+                            statusText.text = "Receiving $name ($pct%)"
+                        }
                     }
+                    statusText.text = "✅ Saved to Downloads: ${savedFile.name}\nReady for next file..."
+                } catch (e: Exception) {
+                    statusText.text = "Receiver note: ${e.message}"
+                    delay(1000)
                 }
-                statusText.text = "✅ Saved to Downloads: ${savedFile.name}"
-            } catch (e: Exception) {
-                statusText.text = "Receive error: ${e.message}"
             }
         }
     }
 
     private fun pickFile() {
-        val intent = Intent(Intent.ACTION_GET_CONTENT).apply { type = "*/*" }
+        val intent = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
+            addCategory(Intent.CATEGORY_OPENABLE)
+            type = "*/*"
+        }
         startActivityForResult(intent, 200)
     }
 
@@ -184,9 +211,12 @@ class MainActivity : Activity() {
     private fun handleSendUri(uri: Uri) {
         val targetIp = ipInput.text.toString().trim()
         if (targetIp.isEmpty()) {
-            statusText.text = "Please enter or Auto-Find Tablet IP first!"
+            statusText.text = "⚠️ Enter or Auto-Find Tablet IP first!"
             return
         }
+        getSharedPreferences("warp_prefs", Context.MODE_PRIVATE)
+            .edit().putString("saved_ip", targetIp).apply()
+
         scope.launch {
             try {
                 statusText.text = "Preparing zero-copy file channel..."
@@ -198,7 +228,7 @@ class MainActivity : Activity() {
                         statusText.text = "Blasting ${tempFile.name} ($pct%)"
                     }
                 }
-                statusText.text = "🚀 Transfer Complete!"
+                statusText.text = "🚀 Transfer Complete! Sent ${tempFile.name}"
                 tempFile.delete()
             } catch (e: Exception) {
                 statusText.text = "Send error: ${e.message}"
@@ -207,7 +237,7 @@ class MainActivity : Activity() {
     }
 
     private fun copyUriToTempFile(uri: Uri): File {
-        var fileName = "warpshare_file"
+        var fileName = "warpshare_${System.currentTimeMillis()}"
         contentResolver.query(uri, null, null, null, null)?.use { cursor ->
             val nameIndex = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
             if (cursor.moveToFirst() && nameIndex >= 0) {
@@ -216,7 +246,7 @@ class MainActivity : Activity() {
         }
         val tempFile = File(cacheDir, fileName)
         contentResolver.openInputStream(uri)?.use { input ->
-            FileOutputStream(tempFile).use { output -> input.copyTo(output, 1024 * 1024) }
+            FileOutputStream(tempFile).use { output -> input.copyTo(output, 4 * 1024 * 1024) }
         }
         return tempFile
     }
@@ -225,6 +255,6 @@ class MainActivity : Activity() {
     private fun getLocalIpAddress(): String {
         val wifiManager = applicationContext.getSystemService(WIFI_SERVICE) as WifiManager
         val ip = wifiManager.connectionInfo.ipAddress
-        return if (ip == 0) "Turn on Wi-Fi / Hotspot" else Formatter.formatIpAddress(ip)
+        return if (ip == 0) "Connect Wi-Fi / Hotspot" else Formatter.formatIpAddress(ip)
     }
 }
