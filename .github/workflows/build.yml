@@ -8,6 +8,9 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: .github/workflows
 
     steps:
       - name: Checkout Repository
@@ -19,7 +22,7 @@ jobs:
           java-version: '17'
           distribution: 'temurin'
 
-      - name: Setup Gradle 8.7 (No wrapper files required)
+      - name: Setup Gradle 8.7
         uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.7'
@@ -31,4 +34,4 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: WarpShare-APK
-          path: app/build/outputs/apk/debug/app-debug.apk
+          path: .github/workflows/app/build/outputs/apk/debug/app-debug.apk
