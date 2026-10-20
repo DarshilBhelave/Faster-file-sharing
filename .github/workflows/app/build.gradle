@@ -10,10 +10,10 @@ android {
     defaultConfig {
         applicationId "com.warpshare.app"
         minSdk 26
-        // targetSdk 28 unlocks silent background Wi-Fi & Bluetooth toggling!
-        targetSdk 28
-        versionCode 1
-        versionName "1.0-WARP"
+        // Upgraded to 34 so Android 16 installs it cleanly without blocks!
+        targetSdk 34
+        versionCode 2
+        versionName "2.0-ANDROID16"
     }
 
     compileOptions {
