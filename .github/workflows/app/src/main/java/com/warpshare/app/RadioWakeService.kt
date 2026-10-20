@@ -40,23 +40,22 @@ class RadioWakeService : Service() {
         startUdpAutoDiscoveryResponder()
     }
 
-    /**
-     * Checks Wi-Fi state; on Android 16 pops up the instant 1-tap Wi-Fi panel if Wi-Fi is off
-     */
     fun ensureWifiReady(context: Context) {
-        val wifiManager = context.applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
-        if (!wifiManager.isWifiEnabled) {
-            onStatusUpdate?.invoke("Wake signal received! Turning on Wi-Fi...")
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                val panelIntent = Intent(Settings.Panel.ACTION_WIFI).apply {
-                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        try {
+            val wifiManager = context.applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
+            if (!wifiManager.isWifiEnabled) {
+                onStatusUpdate?.invoke("Wake signal received! Opening Wi-Fi panel...")
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    val panelIntent = Intent(Settings.Panel.ACTION_WIFI).apply {
+                        addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                    }
+                    context.startActivity(panelIntent)
+                } else {
+                    @Suppress("DEPRECATION")
+                    wifiManager.isWifiEnabled = true
                 }
-                context.startActivity(panelIntent)
-            } else {
-                @Suppress("DEPRECATION")
-                wifiManager.isWifiEnabled = true
             }
-        }
+        } catch (_: Exception) {}
     }
 
     private fun acquireHighSpeedWifiLock() {
@@ -105,22 +104,25 @@ class RadioWakeService : Service() {
             try {
                 ensureWifiReady(context)
                 val btManager = context.getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager
-                val advertiser = btManager.adapter?.bluetoothLeAdvertiser
-                if (advertiser != null) {
-                    val settings = AdvertiseSettings.Builder()
-                        .setAdvertiseMode(AdvertiseSettings.ADVERTISE_MODE_LOW_LATENCY)
-                        .setTxPowerLevel(AdvertiseSettings.ADVERTISE_TX_POWER_HIGH)
-                        .setConnectable(false)
-                        .build()
-                    val data = AdvertiseData.Builder()
-                        .addServiceUuid(ParcelUuid(WARP_UUID))
-                        .build()
-                    val callback = object : AdvertiseCallback() {}
-                    advertiser.startAdvertising(settings, data, callback)
-                    onStatusUpdate?.invoke("Sent BLE Wake Pulse! Stopping BT to prevent interference...")
-                    delay(1500)
+                val adapter = btManager.adapter ?: return@launch
+                val advertiser = adapter.bluetoothLeAdvertiser ?: return@launch
+
+                val settings = AdvertiseSettings.Builder()
+                    .setAdvertiseMode(AdvertiseSettings.ADVERTISE_MODE_LOW_LATENCY)
+                    .setTxPowerLevel(AdvertiseSettings.ADVERTISE_TX_POWER_HIGH)
+                    .setConnectable(false)
+                    .build()
+                val data = AdvertiseData.Builder()
+                    .addServiceUuid(ParcelUuid(WARP_UUID))
+                    .build()
+                
+                val callback = object : AdvertiseCallback() {}
+                advertiser.startAdvertising(settings, data, callback)
+                onStatusUpdate?.invoke("Sent BLE Wake Pulse! Optimizing for Wi-Fi...")
+                delay(1500)
+                try {
                     advertiser.stopAdvertising(callback)
-                }
+                } catch (_: Exception) {}
             } catch (_: Exception) {}
         }
     }
