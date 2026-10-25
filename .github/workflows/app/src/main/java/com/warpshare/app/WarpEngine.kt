@@ -22,7 +22,7 @@ object WarpEngine {
     private const val SOCKET_BUFFER_BYTES = 4 * 1024 * 1024 // 4 MB buffer per stream
 
     /**
-     * SENDER (Phone): Streams directly from Uri using 8 parallel zero-copy file channels (No temp file copy delay!)
+     * SENDER (Phone): Streams 8 parallel chunks and waits for Tablet's final disk-write confirmation.
      */
     suspend fun sendUriDirectly(
         contentResolver: ContentResolver,
@@ -30,10 +30,11 @@ object WarpEngine {
         uri: Uri,
         fileName: String,
         totalSize: Long,
-        onProgress: (speedMBps: Double, percent: Int) -> Unit
+        onProgress: (sentMB: Double, totalMB: Double, speedMBps: Double, percent: Int) -> Unit
     ) = coroutineScope {
         val startTime = System.currentTimeMillis()
         val totalSent = AtomicLong(0L)
+        val totalMB = totalSize / (1024.0 * 1024.0)
 
         // 1. Send Metadata Header (File Name + Exact Byte Size)
         withContext(Dispatchers.IO) {
@@ -43,7 +44,6 @@ object WarpEngine {
                 out.writeUTF(fileName)
                 out.writeLong(totalSize)
                 out.flush()
-                // Wait for Tablet to confirm storage pre-allocation
                 val ack = DataInputStream(metaSocket.getInputStream()).readUTF()
                 if (ack != "READY") throw Exception("Tablet error: $ack")
             }
@@ -75,7 +75,7 @@ object WarpEngine {
                             var remaining = length
                             var currentOffset = offset
                             while (remaining > 0) {
-                                val step = minOf(remaining, 8L * 1024 * 1024)
+                                val step = minOf(remaining, 4L * 1024 * 1024)
                                 val transferred = fileChannel.transferTo(currentOffset, step, socketChannel)
                                 if (transferred <= 0) break
                                 remaining -= transferred
@@ -83,9 +83,16 @@ object WarpEngine {
 
                                 val sentSoFar = totalSent.addAndGet(transferred)
                                 val elapsedSec = ((System.currentTimeMillis() - startTime) / 1000.0).coerceAtLeast(0.1)
-                                val speed = (sentSoFar / (1024.0 * 1024.0)) / elapsedSec
-                                val pct = ((sentSoFar * 100) / totalSize).toInt()
-                                onProgress(speed, pct)
+                                val sentMB = sentSoFar / (1024.0 * 1024.0)
+                                val speed = sentMB / elapsedSec
+                                val pct = ((sentSoFar * 100) / totalSize).toInt().coerceAtMost(99)
+                                onProgress(sentMB, totalMB, speed, pct)
+                            }
+
+                            // CRITICAL: Wait for Tablet to confirm this chunk is 100% written to disk before closing socket!
+                            val ackBuf = ByteBuffer.allocate(1)
+                            while (ackBuf.hasRemaining()) {
+                                if (socketChannel.read(ackBuf) < 0) break
                             }
                         }
                     }
@@ -93,14 +100,17 @@ object WarpEngine {
             }
         }
         jobs.awaitAll()
+        val elapsedSec = ((System.currentTimeMillis() - startTime) / 1000.0).coerceAtLeast(0.1)
+        onProgress(totalMB, totalMB, totalMB / elapsedSec, 100)
     }
 
     /**
-     * RECEIVER (Tablet): Pre-allocates file on disk and writes all 8 streams concurrently.
+     * RECEIVER (Tablet): Pre-allocates file, shows live incoming status on Tablet UI, and sends final ACK.
      */
     suspend fun receiveFile(
         destDir: File,
-        onProgress: (fileName: String, speedMBps: Double, percent: Int) -> Unit
+        onStart: (fileName: String, totalMB: Double, fullPath: String) -> Unit,
+        onProgress: (fileName: String, recMB: Double, totalMB: Double, speedMBps: Double, percent: Int) -> Unit
     ): File = coroutineScope {
         withContext(Dispatchers.IO) {
             ServerSocket().use { metaServer ->
@@ -116,6 +126,7 @@ object WarpEngine {
                     val out = DataOutputStream(metaSocket.getOutputStream())
                     val fileName = input.readUTF()
                     val totalSize = input.readLong()
+                    val totalMB = totalSize / (1024.0 * 1024.0)
 
                     if (!destDir.exists()) destDir.mkdirs()
                     val outFile = File(destDir, fileName)
@@ -124,10 +135,12 @@ object WarpEngine {
                         RandomAccessFile(outFile, "rw").use { raf ->
                             raf.setLength(totalSize)
                         }
+                        // Immediately notify Tablet UI that a file is incoming!
+                        onStart(fileName, totalMB, outFile.absolutePath)
                         out.writeUTF("READY")
                         out.flush()
                     } catch (e: Exception) {
-                        out.writeUTF("Storage Permission Needed: ${e.message}")
+                        out.writeUTF("Tablet Storage Permission Error: ${e.message}")
                         out.flush()
                         metaSocket.close()
                         throw e
@@ -156,7 +169,7 @@ object WarpEngine {
                                     var remaining = length
                                     var currentOffset = offset
                                     while (remaining > 0) {
-                                        val step = minOf(remaining, 8L * 1024 * 1024)
+                                        val step = minOf(remaining, 4L * 1024 * 1024)
                                         val read = fileChannel.transferFrom(clientChannel, currentOffset, step)
                                         if (read <= 0) break
                                         remaining -= read
@@ -164,11 +177,16 @@ object WarpEngine {
 
                                         val recSoFar = totalReceived.addAndGet(read)
                                         val elapsedSec = ((System.currentTimeMillis() - startTime) / 1000.0).coerceAtLeast(0.1)
-                                        val speed = (recSoFar / (1024.0 * 1024.0)) / elapsedSec
+                                        val recMB = recSoFar / (1024.0 * 1024.0)
+                                        val speed = recMB / elapsedSec
                                         val pct = ((recSoFar * 100) / totalSize).toInt()
-                                        onProgress(fileName, speed, pct)
+                                        onProgress(fileName, recMB, totalMB, speed, pct)
                                     }
+                                    // Flush to physical storage and send 1-byte ACK to Phone
+                                    fileChannel.force(false)
                                 }
+                                val ack = ByteBuffer.wrap(byteArrayOf(1))
+                                while (ack.hasRemaining()) clientChannel.write(ack)
                             }
                         }
                     }
