@@ -19,10 +19,11 @@ object WarpEngine {
     private const val PORT_META = 9500
     private const val PORT_DATA = 9501
     private const val PARALLEL_STREAMS = 8
-    private const val SOCKET_BUFFER_BYTES = 4 * 1024 * 1024 // 4 MB buffer per stream
+    private const val SOCKET_BUFFER_BYTES = 4 * 1024 * 1024 // 4 MB socket buffer
 
     /**
-     * SENDER (Phone): Streams 8 parallel chunks and waits for Tablet's final disk-write confirmation.
+     * SENDER (Phone): Uses thread-safe positional NIO ByteBuffer.read(buf, offset) across 8 parallel streams.
+     * Guarantees 100% of bytes are actually transmitted over the network!
      */
     suspend fun sendUriDirectly(
         contentResolver: ContentResolver,
@@ -32,32 +33,40 @@ object WarpEngine {
         totalSize: Long,
         onProgress: (sentMB: Double, totalMB: Double, speedMBps: Double, percent: Int) -> Unit
     ) = coroutineScope {
+        if (totalSize <= 0L) throw Exception("File size is 0 bytes!")
         val startTime = System.currentTimeMillis()
         val totalSent = AtomicLong(0L)
         val totalMB = totalSize / (1024.0 * 1024.0)
 
-        // 1. Send Metadata Header (File Name + Exact Byte Size)
-        withContext(Dispatchers.IO) {
+        // 1. Send Metadata Header & Wait for Tablet to Pre-Allocate File on Disk
+        val tabletSavePath = withContext(Dispatchers.IO) {
             java.net.Socket().use { metaSocket ->
                 metaSocket.connect(InetSocketAddress(targetIp, PORT_META), 6000)
                 val out = DataOutputStream(metaSocket.getOutputStream())
+                val input = DataInputStream(metaSocket.getInputStream())
                 out.writeUTF(fileName)
                 out.writeLong(totalSize)
                 out.flush()
-                val ack = DataInputStream(metaSocket.getInputStream()).readUTF()
-                if (ack != "READY") throw Exception("Tablet error: $ack")
+                val status = input.readUTF()
+                if (!status.startsWith("READY:")) {
+                    throw Exception("Tablet rejected file: $status")
+                }
+                status.removePrefix("READY:")
             }
         }
 
-        // 2. Blast 8 Parallel Streams directly from Storage
-        val chunkSize = totalSize / PARALLEL_STREAMS
-        val jobs = (0 until PARALLEL_STREAMS).map { index ->
-            val offset = index * chunkSize
-            val length = if (index == PARALLEL_STREAMS - 1) (totalSize - offset) else chunkSize
+        // 2. Open ONE shared FileDescriptor and read positionally across 8 parallel coroutines
+        val pfd = contentResolver.openFileDescriptor(uri, "r")
+            ?: throw Exception("Cannot open file on phone")
 
-            async(Dispatchers.IO) {
-                contentResolver.openFileDescriptor(uri, "r")?.use { pfd ->
-                    FileInputStream(pfd.fileDescriptor).channel.use { fileChannel ->
+        try {
+            FileInputStream(pfd.fileDescriptor).channel.use { sharedFileChannel ->
+                val chunkSize = totalSize / PARALLEL_STREAMS
+                val jobs = (0 until PARALLEL_STREAMS).map { index ->
+                    val offset = index * chunkSize
+                    val length = if (index == PARALLEL_STREAMS - 1) (totalSize - offset) else chunkSize
+
+                    async(Dispatchers.IO) {
                         SocketChannel.open().use { socketChannel ->
                             socketChannel.configureBlocking(true)
                             socketChannel.socket().apply {
@@ -66,22 +75,36 @@ object WarpEngine {
                             }
                             socketChannel.connect(InetSocketAddress(targetIp, PORT_DATA))
 
+                            // Send 16-byte Chunk Header: [offset, length]
                             val header = ByteBuffer.allocate(16)
                             header.putLong(offset)
                             header.putLong(length)
                             header.flip()
                             while (header.hasRemaining()) socketChannel.write(header)
 
+                            // Direct 512 KB NIO memory buffer per thread (zero GC lag, 100% reliable)
+                            val buffer = ByteBuffer.allocateDirect(512 * 1024)
                             var remaining = length
                             var currentOffset = offset
-                            while (remaining > 0) {
-                                val step = minOf(remaining, 4L * 1024 * 1024)
-                                val transferred = fileChannel.transferTo(currentOffset, step, socketChannel)
-                                if (transferred <= 0) break
-                                remaining -= transferred
-                                currentOffset += transferred
 
-                                val sentSoFar = totalSent.addAndGet(transferred)
+                            while (remaining > 0) {
+                                buffer.clear()
+                                if (remaining < buffer.capacity()) {
+                                    buffer.limit(remaining.toInt())
+                                }
+                                // Positional read is 100% thread-safe and never returns 0 early!
+                                val bytesRead = sharedFileChannel.read(buffer, currentOffset)
+                                if (bytesRead <= 0) throw Exception("Unexpected EOF reading phone file at $currentOffset")
+
+                                buffer.flip()
+                                while (buffer.hasRemaining()) {
+                                    socketChannel.write(buffer)
+                                }
+
+                                remaining -= bytesRead
+                                currentOffset += bytesRead
+
+                                val sentSoFar = totalSent.addAndGet(bytesRead.toLong())
                                 val elapsedSec = ((System.currentTimeMillis() - startTime) / 1000.0).coerceAtLeast(0.1)
                                 val sentMB = sentSoFar / (1024.0 * 1024.0)
                                 val speed = sentMB / elapsedSec
@@ -89,111 +112,8 @@ object WarpEngine {
                                 onProgress(sentMB, totalMB, speed, pct)
                             }
 
-                            // CRITICAL: Wait for Tablet to confirm this chunk is 100% written to disk before closing socket!
-                            val ackBuf = ByteBuffer.allocate(1)
-                            while (ackBuf.hasRemaining()) {
-                                if (socketChannel.read(ackBuf) < 0) break
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        jobs.awaitAll()
-        val elapsedSec = ((System.currentTimeMillis() - startTime) / 1000.0).coerceAtLeast(0.1)
-        onProgress(totalMB, totalMB, totalMB / elapsedSec, 100)
-    }
-
-    /**
-     * RECEIVER (Tablet): Pre-allocates file, shows live incoming status on Tablet UI, and sends final ACK.
-     */
-    suspend fun receiveFile(
-        destDir: File,
-        onStart: (fileName: String, totalMB: Double, fullPath: String) -> Unit,
-        onProgress: (fileName: String, recMB: Double, totalMB: Double, speedMBps: Double, percent: Int) -> Unit
-    ): File = coroutineScope {
-        withContext(Dispatchers.IO) {
-            ServerSocket().use { metaServer ->
-                metaServer.reuseAddress = true
-                metaServer.bind(InetSocketAddress(PORT_META))
-
-                ServerSocketChannel.open().use { dataServer ->
-                    dataServer.socket().reuseAddress = true
-                    dataServer.socket().bind(InetSocketAddress(PORT_DATA))
-
-                    val metaSocket = metaServer.accept()
-                    val input = DataInputStream(metaSocket.getInputStream())
-                    val out = DataOutputStream(metaSocket.getOutputStream())
-                    val fileName = input.readUTF()
-                    val totalSize = input.readLong()
-                    val totalMB = totalSize / (1024.0 * 1024.0)
-
-                    if (!destDir.exists()) destDir.mkdirs()
-                    val outFile = File(destDir, fileName)
-
-                    try {
-                        RandomAccessFile(outFile, "rw").use { raf ->
-                            raf.setLength(totalSize)
-                        }
-                        // Immediately notify Tablet UI that a file is incoming!
-                        onStart(fileName, totalMB, outFile.absolutePath)
-                        out.writeUTF("READY")
-                        out.flush()
-                    } catch (e: Exception) {
-                        out.writeUTF("Tablet Storage Permission Error: ${e.message}")
-                        out.flush()
-                        metaSocket.close()
-                        throw e
-                    }
-                    metaSocket.close()
-
-                    val startTime = System.currentTimeMillis()
-                    val totalReceived = AtomicLong(0L)
-
-                    val workers = (0 until PARALLEL_STREAMS).map {
-                        async(Dispatchers.IO) {
-                            dataServer.accept().use { clientChannel ->
-                                clientChannel.configureBlocking(true)
-                                clientChannel.socket().apply {
-                                    tcpNoDelay = true
-                                    receiveBufferSize = SOCKET_BUFFER_BYTES
-                                }
-
-                                val header = ByteBuffer.allocate(16)
-                                while (header.hasRemaining()) clientChannel.read(header)
-                                header.flip()
-                                val offset = header.long
-                                val length = header.long
-
-                                RandomAccessFile(outFile, "rw").channel.use { fileChannel ->
-                                    var remaining = length
-                                    var currentOffset = offset
-                                    while (remaining > 0) {
-                                        val step = minOf(remaining, 4L * 1024 * 1024)
-                                        val read = fileChannel.transferFrom(clientChannel, currentOffset, step)
-                                        if (read <= 0) break
-                                        remaining -= read
-                                        currentOffset += read
-
-                                        val recSoFar = totalReceived.addAndGet(read)
-                                        val elapsedSec = ((System.currentTimeMillis() - startTime) / 1000.0).coerceAtLeast(0.1)
-                                        val recMB = recSoFar / (1024.0 * 1024.0)
-                                        val speed = recMB / elapsedSec
-                                        val pct = ((recSoFar * 100) / totalSize).toInt()
-                                        onProgress(fileName, recMB, totalMB, speed, pct)
-                                    }
-                                    // Flush to physical storage and send 1-byte ACK to Phone
-                                    fileChannel.force(false)
-                                }
-                                val ack = ByteBuffer.wrap(byteArrayOf(1))
-                                while (ack.hasRemaining()) clientChannel.write(ack)
-                            }
-                        }
-                    }
-                    workers.awaitAll()
-                    outFile
-                }
-            }
-        }
-    }
-}
+                            // Wait for Tablet to verify every byte of this chunk is on disk!
+                            val ack = ByteBuffer.allocate(1)
+                            val ackRead = socketChannel.read(ack)
+                            if (ackRead != 1 || ack.get(0) != 1.toByte()) {
+                                throw Exception
