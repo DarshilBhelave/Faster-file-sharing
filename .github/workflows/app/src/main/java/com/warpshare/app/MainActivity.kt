@@ -187,16 +187,151 @@ class MainActivity : Activity() {
     }
 
     private fun getFallbackSaveFolder(): File {
-        return externalMediaDirs.firstOrNull() ?: getExternalFilesDir(null) ?: filesDir
+        val mediaDirs = externalMediaDirs
+        if (mediaDirs != null && mediaDirs.isNotEmpty() && mediaDirs[0] != null) {
+            return mediaDirs[0]
+        }
+        return getExternalFilesDir(null) ?: filesDir
     }
 
     private fun getSavedFilesSummary(): String {
-        val primary = getPrimarySaveFolder()
-        val fallback = getFallbackSaveFolder()
-        val files = (primary.listFiles()?.toList() ?: emptyList()) +
-                    (fallback.listFiles()?.toList() ?: emptyList())
-        return if (files.isEmpty()) {
-            "📁 Save Location:\nInternal Storage > Download > WarpShare\n(No files received yet)"
-        } else {
-            val latest = files.maxByOrNull { it.lastModified() }!!
-            "✅ Latest File on Disk:\
+        val list1 = getPrimarySaveFolder().listFiles()?.toList() ?: emptyList()
+        val list2 = getFallbackSaveFolder().listFiles()?.toList() ?: emptyList()
+        val allFiles = list1 + list2
+        if (allFiles.isEmpty()) {
+            return "📁 Save Location:\nInternal Storage > Download > WarpShare\n(No files received yet)"
+        }
+        var latest = allFiles[0]
+        for (f in allFiles) {
+            if (f.lastModified() > latest.lastModified()) {
+                latest = f
+            }
+        }
+        return "✅ Latest File on Disk:\n${latest.name} (${latest.length() / (1024 * 1024)} MB)\nPath: ${latest.absolutePath}"
+    }
+
+    private fun startAutoReceiverLoop() {
+        scope.launch {
+            while (isActive) {
+                try {
+                    val savedFile = WarpEngine.receiveFile(
+                        primaryDir = getPrimarySaveFolder(),
+                        fallbackDir = getFallbackSaveFolder(),
+                        onStart = { fileName, totalMB, fullPath ->
+                            runOnUiThread {
+                                progressBar.progress = 0
+                                statusText.setTextColor(Color.parseColor("#FACC15"))
+                                statusText.text = "📥 INCOMING:\n$fileName (${String.format("%.1f", totalMB)} MB)"
+                                pathBox.text = "⏳ Writing to:\n$fullPath"
+                            }
+                        },
+                        onProgress = { name, recMB, totalMB, speed, pct ->
+                            runOnUiThread {
+                                speedText.text = String.format("%.1f MB/s", speed)
+                                progressBar.progress = pct
+                                statusText.text = "📥 Receiving: $name\n${String.format("%.0f", recMB)} / ${String.format("%.0f", totalMB)} MB ($pct%)"
+                            }
+                        }
+                    )
+
+                    MediaScannerConnection.scanFile(
+                        this@MainActivity,
+                        arrayOf(savedFile.absolutePath),
+                        null,
+                        null
+                    )
+
+                    runOnUiThread {
+                        progressBar.progress = 100
+                        statusText.setTextColor(Color.parseColor("#4ADE80"))
+                        statusText.text = "✅ RECEIVED 100%:\n${savedFile.name} (${savedFile.length() / (1024 * 1024)} MB)"
+                        pathBox.text = "✅ Verified on Tablet Disk!\nPath: ${savedFile.absolutePath}"
+                    }
+                } catch (e: Exception) {
+                    runOnUiThread {
+                        statusText.setTextColor(Color.parseColor("#F87171"))
+                        statusText.text = "⚠️ Receiver Note: ${e.message}"
+                    }
+                    delay(1500)
+                }
+            }
+        }
+    }
+
+    private fun pickFile() {
+        val intent = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
+            addCategory(Intent.CATEGORY_OPENABLE)
+            type = "*/*"
+        }
+        startActivityForResult(intent, 200)
+    }
+
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode == 200 && resultCode == RESULT_OK) {
+            data?.data?.let { blastFileNow(it) }
+        }
+    }
+
+    private fun blastFileNow(uri: Uri) {
+        scope.launch {
+            var targetIp = RadioWakeService.peerIp
+            if (targetIp == null) {
+                statusText.text = "🔍 Searching Hotspot for Tablet..."
+                repeat(8) {
+                    delay(500)
+                    targetIp = RadioWakeService.peerIp
+                    if (targetIp != null) return@repeat
+                }
+            }
+
+            val finalIp = targetIp
+            if (finalIp == null) {
+                statusText.text = "⚠️ Tablet not found! Open WarpShare v4.0 on BOTH screens."
+                return@launch
+            }
+
+            try {
+                val meta = getFileMeta(uri)
+                val fileName = meta.first
+                val fileSize = meta.second
+                statusText.setTextColor(Color.parseColor("#FACC15"))
+                statusText.text = "🚀 Connecting to Tablet ($finalIp)..."
+                val tabletPath = WarpEngine.sendUriDirectly(
+                    contentResolver, finalIp, uri, fileName, fileSize
+                ) { sentMB, totalMB, speed, pct ->
+                    runOnUiThread {
+                        speedText.text = String.format("%.1f MB/s", speed)
+                        progressBar.progress = pct
+                        statusText.text = "🚀 Sending: $fileName\n${String.format("%.0f", sentMB)} / ${String.format("%.0f", totalMB)} MB ($pct%)"
+                    }
+                }
+                statusText.setTextColor(Color.parseColor("#4ADE80"))
+                statusText.text = "✅ 100% Sent & Verified on Tablet!"
+                pathBox.text = "✅ Tablet Saved File To:\n$tabletPath"
+            } catch (e: Exception) {
+                statusText.setTextColor(Color.parseColor("#F87171"))
+                statusText.text = "❌ Send Error: ${e.message}"
+            }
+        }
+    }
+
+    private fun getFileMeta(uri: Uri): Pair<String, Long> {
+        var name = "warpshare_${System.currentTimeMillis()}"
+        var size = 0L
+        contentResolver.query(uri, null, null, null, null)?.use { cursor ->
+            val nameIdx = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+            val sizeIdx = cursor.getColumnIndex(OpenableColumns.SIZE)
+            if (cursor.moveToFirst()) {
+                if (nameIdx >= 0) name = cursor.getString(nameIdx)
+                if (sizeIdx >= 0) size = cursor.getLong(sizeIdx)
+            }
+        }
+        if (size <= 0L) {
+            contentResolver.openFileDescriptor(uri, "r")?.use { pfd ->
+                size = pfd.statSize
+            }
+        }
+        return Pair(name, size)
+    }
+}
