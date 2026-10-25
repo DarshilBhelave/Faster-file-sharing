@@ -19,11 +19,8 @@ object WarpEngine {
     private const val PORT_META = 9500
     private const val PORT_DATA = 9501
     private const val PARALLEL_STREAMS = 8
-    private const val SOCKET_BUFFER_BYTES = 4 * 1024 * 1024 // 4 MB socket buffer
+    private const val SOCKET_BUFFER_BYTES = 4 * 1024 * 1024
 
-    /**
-     * SENDER (Phone): Uses thread-safe positional NIO ByteBuffer.read(buf, offset) across 8 parallel streams.
-     */
     suspend fun sendUriDirectly(
         contentResolver: ContentResolver,
         targetIp: String,
@@ -37,7 +34,6 @@ object WarpEngine {
         val totalSent = AtomicLong(0L)
         val totalMB = totalSize / (1024.0 * 1024.0)
 
-        // 1. Send Metadata Header & Wait for Tablet to Pre-Allocate File on Disk
         val tabletSavePath: String = withContext(Dispatchers.IO) {
             java.net.Socket().use { metaSocket ->
                 metaSocket.connect(InetSocketAddress(targetIp, PORT_META), 6000)
@@ -54,7 +50,6 @@ object WarpEngine {
             }
         }
 
-        // 2. Open ONE shared FileDescriptor and read positionally across 8 parallel coroutines
         val pfd = contentResolver.openFileDescriptor(uri, "r")
             ?: throw Exception("Cannot open file on phone")
 
@@ -90,7 +85,7 @@ object WarpEngine {
                                     buffer.limit(remaining.toInt())
                                 }
                                 val bytesRead = sharedFileChannel.read(buffer, currentOffset)
-                                if (bytesRead <= 0) throw Exception("Unexpected EOF reading phone file at $currentOffset")
+                                if (bytesRead <= 0) throw Exception("EOF at $currentOffset")
 
                                 buffer.flip()
                                 while (buffer.hasRemaining()) {
@@ -108,7 +103,6 @@ object WarpEngine {
                                 onProgress(sentMB, totalMB, speed, pct)
                             }
 
-                            // Wait for Tablet to verify every byte of this chunk is on disk
                             val ack = ByteBuffer.allocate(1)
                             val ackRead = socketChannel.read(ack)
                             if (ackRead != 1 || ack.get(0) != 1.toByte()) {
@@ -124,16 +118,13 @@ object WarpEngine {
         }
 
         if (totalSent.get() != totalSize) {
-            throw Exception("Incomplete send: ${totalSent.get()} /$totalSize bytes")
+            throw Exception("Incomplete send: ${totalSent.get()} / $totalSize")
         }
         val elapsedSec = ((System.currentTimeMillis() - startTime) / 1000.0).coerceAtLeast(0.1)
         onProgress(totalMB, totalMB, totalMB / elapsedSec, 100)
         tabletSavePath
     }
 
-    /**
-     * RECEIVER (Tablet): Pre-allocates file, verifies 100% byte count, and writes to disk.
-     */
     suspend fun receiveFile(
         primaryDir: File,
         fallbackDir: File,
@@ -186,7 +177,7 @@ object WarpEngine {
 
                                     val header = ByteBuffer.allocate(16)
                                     while (header.hasRemaining()) {
-                                        if (clientChannel.read(header) < 0) throw Exception("Stream closed reading header")
+                                        if (clientChannel.read(header) < 0) throw Exception("Stream closed")
                                     }
                                     header.flip()
                                     val offset = header.long
@@ -202,4 +193,38 @@ object WarpEngine {
                                             buffer.limit(remaining.toInt())
                                         }
                                         val bytesRead = clientChannel.read(buffer)
-                                        if (bytesRead <= 0) throw Exception("Connection dropped with
+                                        if (bytesRead <= 0) throw Exception("Dropped with $remaining left")
+
+                                        buffer.flip()
+                                        while (buffer.hasRemaining()) {
+                                            val written = sharedOutChannel.write(buffer, currentOffset)
+                                            currentOffset += written
+                                        }
+                                        remaining -= bytesRead
+
+                                        val recSoFar = totalReceived.addAndGet(bytesRead.toLong())
+                                        val elapsedSec = ((System.currentTimeMillis() - startTime) / 1000.0).coerceAtLeast(0.1)
+                                        val recMB = recSoFar / (1024.0 * 1024.0)
+                                        val speed = recMB / elapsedSec
+                                        val pct = ((recSoFar * 100) / totalSize).toInt()
+                                        onProgress(fileName, recMB, totalMB, speed, pct)
+                                    }
+
+                                    val ack = ByteBuffer.wrap(byteArrayOf(1))
+                                    while (ack.hasRemaining()) clientChannel.write(ack)
+                                }
+                            }
+                        }
+                        workers.awaitAll()
+                        sharedOutChannel.force(true)
+                    }
+
+                    if (totalReceived.get() != totalSize) {
+                        throw Exception("Incomplete receive")
+                    }
+                    outFile
+                }
+            }
+        }
+    }
+}
