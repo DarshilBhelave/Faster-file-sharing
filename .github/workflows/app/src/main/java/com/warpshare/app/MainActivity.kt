@@ -17,6 +17,7 @@ import android.view.Gravity
 import android.widget.*
 import kotlinx.coroutines.*
 import java.io.File
+import java.net.BindException
 
 class MainActivity : Activity() {
 
@@ -56,7 +57,7 @@ class MainActivity : Activity() {
         }
 
         val title = TextView(this).apply {
-            text = "⚡ WARPSHARE v4.0"
+            text = "⚡ WARPSHARE v4.6"
             textSize = 26f
             setTypeface(null, Typeface.BOLD)
             setTextColor(Color.WHITE)
@@ -211,49 +212,59 @@ class MainActivity : Activity() {
     }
 
     private fun startAutoReceiverLoop() {
+        // Guard: Prevents duplicate receiver loops from starting when the file picker closes!
+        if (!WarpEngine.isReceiverRunning.compareAndSet(false, true)) return
+
         scope.launch {
-            while (isActive) {
-                try {
-                    val savedFile = WarpEngine.receiveFile(
-                        primaryDir = getPrimarySaveFolder(),
-                        fallbackDir = getFallbackSaveFolder(),
-                        onStart = { fileName, totalMB, fullPath ->
-                            runOnUiThread {
-                                progressBar.progress = 0
-                                statusText.setTextColor(Color.parseColor("#FACC15"))
-                                statusText.text = "📥 INCOMING:\n$fileName (${String.format("%.1f", totalMB)} MB)"
-                                pathBox.text = "⏳ Writing to:\n$fullPath"
+            try {
+                while (isActive) {
+                    try {
+                        val savedFile = WarpEngine.receiveFile(
+                            primaryDir = getPrimarySaveFolder(),
+                            fallbackDir = getFallbackSaveFolder(),
+                            onStart = { fileName, totalMB, fullPath ->
+                                runOnUiThread {
+                                    progressBar.progress = 0
+                                    statusText.setTextColor(Color.parseColor("#FACC15"))
+                                    statusText.text = "📥 INCOMING:\n$fileName (${String.format("%.1f", totalMB)} MB)"
+                                    pathBox.text = "⏳ Writing to:\n$fullPath"
+                                }
+                            },
+                            onProgress = { name, recMB, totalMB, speed, pct ->
+                                runOnUiThread {
+                                    speedText.text = String.format("%.1f MB/s", speed)
+                                    progressBar.progress = pct
+                                    statusText.text = "📥 Receiving: $name\n${String.format("%.0f", recMB)} / ${String.format("%.0f", totalMB)} MB ($pct%)"
+                                }
                             }
-                        },
-                        onProgress = { name, recMB, totalMB, speed, pct ->
+                        )
+
+                        MediaScannerConnection.scanFile(
+                            this@MainActivity,
+                            arrayOf(savedFile.absolutePath),
+                            null,
+                            null
+                        )
+
+                        runOnUiThread {
+                            progressBar.progress = 100
+                            statusText.setTextColor(Color.parseColor("#4ADE80"))
+                            statusText.text = "✅ RECEIVED 100%:\n${savedFile.name} (${savedFile.length() / (1024 * 1024)} MB)"
+                            pathBox.text = "✅ Verified on Tablet Disk!\nPath: ${savedFile.absolutePath}"
+                        }
+                    } catch (e: Exception) {
+                        // Never display EADDRINUSE bind warnings on screen
+                        if (e !is BindException && !(e.message?.contains("EADDRINUSE") == true)) {
                             runOnUiThread {
-                                speedText.text = String.format("%.1f MB/s", speed)
-                                progressBar.progress = pct
-                                statusText.text = "📥 Receiving: $name\n${String.format("%.0f", recMB)} / ${String.format("%.0f", totalMB)} MB ($pct%)"
+                                statusText.setTextColor(Color.parseColor("#F87171"))
+                                statusText.text = "⚠️ Receiver Note: ${e.message}"
                             }
                         }
-                    )
-
-                    MediaScannerConnection.scanFile(
-                        this@MainActivity,
-                        arrayOf(savedFile.absolutePath),
-                        null,
-                        null
-                    )
-
-                    runOnUiThread {
-                        progressBar.progress = 100
-                        statusText.setTextColor(Color.parseColor("#4ADE80"))
-                        statusText.text = "✅ RECEIVED 100%:\n${savedFile.name} (${savedFile.length() / (1024 * 1024)} MB)"
-                        pathBox.text = "✅ Verified on Tablet Disk!\nPath: ${savedFile.absolutePath}"
+                        delay(1500)
                     }
-                } catch (e: Exception) {
-                    runOnUiThread {
-                        statusText.setTextColor(Color.parseColor("#F87171"))
-                        statusText.text = "⚠️ Receiver Note: ${e.message}"
-                    }
-                    delay(1500)
                 }
+            } finally {
+                WarpEngine.isReceiverRunning.set(false)
             }
         }
     }
@@ -287,7 +298,7 @@ class MainActivity : Activity() {
 
             val finalIp = targetIp
             if (finalIp == null) {
-                statusText.text = "⚠️ Tablet not found! Open WarpShare v4.0 on BOTH screens."
+                statusText.text = "⚠️ Tablet not found! Open WarpShare on BOTH screens."
                 return@launch
             }
 
@@ -333,5 +344,11 @@ class MainActivity : Activity() {
             }
         }
         return Pair(name, size)
+    }
+
+    override fun onDestroy() {
+        WarpEngine.isReceiverRunning.set(false)
+        scope.cancel()
+        super.onDestroy()
     }
 }
