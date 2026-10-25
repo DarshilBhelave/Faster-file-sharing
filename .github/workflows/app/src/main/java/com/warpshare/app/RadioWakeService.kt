@@ -1,5 +1,6 @@
 package com.warpshare.app
 
+import android.annotation.SuppressLint
 import android.app.*
 import android.content.Context
 import android.content.Intent
@@ -14,16 +15,16 @@ import java.net.Inet4Address
 import java.net.InetAddress
 import java.net.NetworkInterface
 
+@SuppressLint("MissingPermission")
 class RadioWakeService : Service() {
 
     companion object {
         private const val RADAR_PORT = 9499
         @Volatile var peerIp: String? = null
         var onPeerConnected: ((String) -> Unit)? = null
+        var onStatusUpdate: ((String) -> Unit)? = null
+        var onTabletIpFound: ((String) -> Unit)? = null
 
-        /**
-         * Finds the real Hotspot or Wi-Fi IP (ignores mobile data IPs like 192.0.0.4)
-         */
         fun getLocalHotspotIp(): String? {
             try {
                 val interfaces = NetworkInterface.getNetworkInterfaces()
@@ -38,7 +39,7 @@ class RadioWakeService : Service() {
                         val addr = addrs.nextElement()
                         if (addr is Inet4Address && !addr.isLoopbackAddress) {
                             val ip = addr.hostAddress ?: continue
-                            if (ip.startsWith("192.0.0.")) continue // Skip cellular CLAT
+                            if (ip.startsWith("192.0.0.")) continue
                             if (isHotspotOrWifi) return ip
                             if (fallback == null) fallback = ip
                         }
@@ -77,9 +78,6 @@ class RadioWakeService : Service() {
         } catch (_: Exception) {}
     }
 
-    /**
-     * Listens continuously for the other device on the Hotspot
-     */
     private fun startHotspotRadarListener() {
         scope.launch {
             while (isActive) {
@@ -97,8 +95,8 @@ class RadioWakeService : Service() {
                             if (msg.startsWith("WARP_HELLO") && senderIp != myIp) {
                                 peerIp = senderIp
                                 onPeerConnected?.invoke(senderIp)
+                                onTabletIpFound?.invoke(senderIp)
 
-                                // Instantly reply directly to the sender so both devices lock on!
                                 val reply = "WARP_HELLO".toByteArray()
                                 socket.send(DatagramPacket(reply, reply.size, packet.address, RADAR_PORT))
                             }
@@ -111,10 +109,6 @@ class RadioWakeService : Service() {
         }
     }
 
-    /**
-     * Every 1.2 seconds, pings the Hotspot subnet (xxx.xxx.xxx.255 and 255.255.255.255)
-     * so the Phone and Tablet discover each other automatically with zero clicks.
-     */
     private fun startHotspotRadarBeacon() {
         scope.launch {
             DatagramSocket().use { socket ->
@@ -124,15 +118,11 @@ class RadioWakeService : Service() {
                     try {
                         val myIp = getLocalHotspotIp()
                         if (myIp != null) {
-                            // 1. Broadcast to global 255.255.255.255
                             socket.send(DatagramPacket(msg, msg.size, InetAddress.getByName("255.255.255.255"), RADAR_PORT))
-
-                            // 2. Broadcast directly to the Hotspot's exact /24 subnet (e.g. 192.168.43.255 or 10.131.235.255)
                             val parts = myIp.split(".")
                             if (parts.size == 4) {
                                 val subnetBroadcast = "${parts[0]}.${parts[1]}.${parts[2]}.255"
                                 socket.send(DatagramPacket(msg, msg.size, InetAddress.getByName(subnetBroadcast), RADAR_PORT))
-                                // Also ping the Hotspot gateway (.1) directly in case broadcast is filtered
                                 val gatewayIp = "${parts[0]}.${parts[1]}.${parts[2]}.1"
                                 if (gatewayIp != myIp) {
                                     socket.send(DatagramPacket(msg, msg.size, InetAddress.getByName(gatewayIp), RADAR_PORT))
