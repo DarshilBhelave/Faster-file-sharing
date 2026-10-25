@@ -8,7 +8,6 @@ import java.io.DataOutputStream
 import java.io.File
 import java.io.FileInputStream
 import java.io.RandomAccessFile
-import java.net.BindException
 import java.net.InetSocketAddress
 import java.net.ServerSocket
 import java.nio.ByteBuffer
@@ -21,8 +20,8 @@ object WarpEngine {
     private const val PORT_META = 9500
     private const val PORT_DATA = 9501
     private const val PARALLEL_STREAMS = 4
-    private const val DIRECT_BUFFER_BYTES = 4 * 1024 * 1024 // 4 MB Direct RAM block per thread
-    private const val SOCKET_BUFFER_BYTES = 8 * 1024 * 1024 // 8 MB Kernel TCP Window
+    private const val DIRECT_BUFFER_BYTES = 4 * 1024 * 1024
+    private const val SOCKET_BUFFER_BYTES = 8 * 1024 * 1024
 
     @Volatile var isTransferring = false
     val isReceiverRunning = AtomicBoolean(false)
@@ -82,7 +81,6 @@ object WarpEngine {
                 }
             }
 
-            // Start timer AFTER metadata handshake so small files show true transfer speed!
             val startTime = System.currentTimeMillis()
             val chunkSize = totalSize / PARALLEL_STREAMS
 
@@ -91,7 +89,6 @@ object WarpEngine {
                 val length = if (index == PARALLEL_STREAMS - 1) (totalSize - offset) else chunkSize
 
                 async(Dispatchers.IO) {
-                    // Each thread opens its own independent FileDescriptor to avoid kernel lock contention!
                     contentResolver.openFileDescriptor(uri, "r")?.use { pfd ->
                         FileInputStream(pfd.fileDescriptor).channel.use { fileChannel ->
                             SocketChannel.open().use { socketChannel ->
@@ -168,7 +165,9 @@ object WarpEngine {
         onProgress: (fileName: String, recMB: Double, totalMB: Double, speedMBps: Double, percent: Int) -> Unit
     ): File = coroutineScope {
         withContext(Dispatchers.IO) {
-            val (metaServer, dataServer) = getOrBindServers()
+            val servers = getOrBindServers()
+            val metaServer = servers.first
+            val dataServer = servers.second
 
             val metaSocket = metaServer.accept()
             isTransferring = true
@@ -216,7 +215,6 @@ object WarpEngine {
                             val offset = header.long
                             val length = header.long
 
-                            // Independent RandomAccessFile per thread removes kernel inode lock bottleneck!
                             RandomAccessFile(outFile, "rw").channel.use { threadOutChannel ->
                                 val buffer = ByteBuffer.allocateDirect(DIRECT_BUFFER_BYTES)
                                 var remaining = length
@@ -242,28 +240,4 @@ object WarpEngine {
                                     val prev = lastUiUpdate.get()
                                     if (now - prev >= 150 && lastUiUpdate.compareAndSet(prev, now)) {
                                         val elapsedSec = ((now - startTime) / 1000.0).coerceAtLeast(0.01)
-                                        val recMB = recSoFar / (1024.0 * 1024.0)
-                                        val speed = recMB / elapsedSec
-                                        val pct = ((recSoFar * 100) / totalSize).toInt()
-                                        onProgress(fileName, recMB, totalMB, speed, pct)
-                                    }
-                                }
-                            }
-
-                            val ack = ByteBuffer.wrap(byteArrayOf(1))
-                            while (ack.hasRemaining()) clientChannel.write(ack)
-                        }
-                    }
-                }
-                workers.awaitAll()
-
-                if (totalReceived.get() != totalSize) {
-                    throw Exception("Incomplete receive")
-                }
-                outFile
-            } finally {
-                isTransferring = false
-            }
-        }
-    }
-}
+                                        
