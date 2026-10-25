@@ -18,8 +18,12 @@ import java.util.concurrent.atomic.AtomicLong
 object WarpEngine {
     private const val PORT_META = 9500
     private const val PORT_DATA = 9501
-    private const val PARALLEL_STREAMS = 8
-    private const val SOCKET_BUFFER_BYTES = 4 * 1024 * 1024
+    // 4 parallel streams with massive 4 MB direct buffers prevents UFS/eMMC flash seek thrashing!
+    private const val PARALLEL_STREAMS = 4
+    private const val DIRECT_BUFFER_BYTES = 4 * 1024 * 1024 // 4 MB Direct RAM block per thread
+    private const val SOCKET_BUFFER_BYTES = 8 * 1024 * 1024 // 8 MB Kernel TCP Window
+
+    @Volatile var isTransferring = false
 
     suspend fun sendUriDirectly(
         contentResolver: ContentResolver,
@@ -30,99 +34,109 @@ object WarpEngine {
         onProgress: (sentMB: Double, totalMB: Double, speedMBps: Double, percent: Int) -> Unit
     ): String = coroutineScope {
         if (totalSize <= 0L) throw Exception("File size is 0 bytes!")
+        isTransferring = true
         val startTime = System.currentTimeMillis()
         val totalSent = AtomicLong(0L)
+        val lastUiUpdate = AtomicLong(0L)
         val totalMB = totalSize / (1024.0 * 1024.0)
 
-        val tabletSavePath: String = withContext(Dispatchers.IO) {
-            java.net.Socket().use { metaSocket ->
-                metaSocket.connect(InetSocketAddress(targetIp, PORT_META), 6000)
-                val out = DataOutputStream(metaSocket.getOutputStream())
-                val input = DataInputStream(metaSocket.getInputStream())
-                out.writeUTF(fileName)
-                out.writeLong(totalSize)
-                out.flush()
-                val status = input.readUTF()
-                if (!status.startsWith("READY:")) {
-                    throw Exception("Tablet rejected file: $status")
-                }
-                status.removePrefix("READY:")
-            }
-        }
-
-        val pfd = contentResolver.openFileDescriptor(uri, "r")
-            ?: throw Exception("Cannot open file on phone")
-
         try {
-            FileInputStream(pfd.fileDescriptor).channel.use { sharedFileChannel ->
-                val chunkSize = totalSize / PARALLEL_STREAMS
-                val jobs = (0 until PARALLEL_STREAMS).map { index ->
-                    val offset = index * chunkSize
-                    val length = if (index == PARALLEL_STREAMS - 1) (totalSize - offset) else chunkSize
+            val tabletSavePath: String = withContext(Dispatchers.IO) {
+                java.net.Socket().use { metaSocket ->
+                    metaSocket.connect(InetSocketAddress(targetIp, PORT_META), 6000)
+                    val out = DataOutputStream(metaSocket.getOutputStream())
+                    val input = DataInputStream(metaSocket.getInputStream())
+                    out.writeUTF(fileName)
+                    out.writeLong(totalSize)
+                    out.flush()
+                    val status = input.readUTF()
+                    if (!status.startsWith("READY:")) {
+                        throw Exception("Tablet rejected file: $status")
+                    }
+                    status.removePrefix("READY:")
+                }
+            }
 
-                    async(Dispatchers.IO) {
-                        SocketChannel.open().use { socketChannel ->
-                            socketChannel.configureBlocking(true)
-                            socketChannel.socket().apply {
-                                tcpNoDelay = true
-                                sendBufferSize = SOCKET_BUFFER_BYTES
-                            }
-                            socketChannel.connect(InetSocketAddress(targetIp, PORT_DATA))
+            val pfd = contentResolver.openFileDescriptor(uri, "r")
+                ?: throw Exception("Cannot open file on phone")
 
-                            val header = ByteBuffer.allocate(16)
-                            header.putLong(offset)
-                            header.putLong(length)
-                            header.flip()
-                            while (header.hasRemaining()) socketChannel.write(header)
+            try {
+                FileInputStream(pfd.fileDescriptor).channel.use { sharedFileChannel ->
+                    val chunkSize = totalSize / PARALLEL_STREAMS
+                    val jobs = (0 until PARALLEL_STREAMS).map { index ->
+                        val offset = index * chunkSize
+                        val length = if (index == PARALLEL_STREAMS - 1) (totalSize - offset) else chunkSize
 
-                            val buffer = ByteBuffer.allocateDirect(512 * 1024)
-                            var remaining = length
-                            var currentOffset = offset
-
-                            while (remaining > 0) {
-                                buffer.clear()
-                                if (remaining < buffer.capacity()) {
-                                    buffer.limit(remaining.toInt())
+                        async(Dispatchers.IO) {
+                            SocketChannel.open().use { socketChannel ->
+                                socketChannel.configureBlocking(true)
+                                socketChannel.socket().apply {
+                                    tcpNoDelay = true
+                                    sendBufferSize = SOCKET_BUFFER_BYTES
+                                    // IPTOS_LOWDELAY (0x10) | IPTOS_THROUGHPUT (0x08) for 5GHz Wi-Fi WMM priority
+                                    trafficClass = 0x18
                                 }
-                                val bytesRead = sharedFileChannel.read(buffer, currentOffset)
-                                if (bytesRead <= 0) throw Exception("EOF at $currentOffset")
+                                socketChannel.connect(InetSocketAddress(targetIp, PORT_DATA))
 
-                                buffer.flip()
-                                while (buffer.hasRemaining()) {
-                                    socketChannel.write(buffer)
+                                val header = ByteBuffer.allocate(16)
+                                header.putLong(offset)
+                                header.putLong(length)
+                                header.flip()
+                                while (header.hasRemaining()) socketChannel.write(header)
+
+                                val buffer = ByteBuffer.allocateDirect(DIRECT_BUFFER_BYTES)
+                                var remaining = length
+                                var currentOffset = offset
+
+                                while (remaining > 0) {
+                                    buffer.clear()
+                                    if (remaining < buffer.capacity()) {
+                                        buffer.limit(remaining.toInt())
+                                    }
+                                    val bytesRead = sharedFileChannel.read(buffer, currentOffset)
+                                    if (bytesRead <= 0) throw Exception("EOF at $currentOffset")
+
+                                    buffer.flip()
+                                    while (buffer.hasRemaining()) {
+                                        socketChannel.write(buffer)
+                                    }
+
+                                    remaining -= bytesRead
+                                    currentOffset += bytesRead
+
+                                    val sentSoFar = totalSent.addAndGet(bytesRead.toLong())
+                                    val now = System.currentTimeMillis()
+                                    val prev = lastUiUpdate.get()
+                                    // Throttle UI updates to once every 150ms so main thread never chokes throughput!
+                                    if (now - prev >= 150 && lastUiUpdate.compareAndSet(prev, now)) {
+                                        val elapsedSec = ((now - startTime) / 1000.0).coerceAtLeast(0.05)
+                                        val sentMB = sentSoFar / (1024.0 * 1024.0)
+                                        val speed = sentMB / elapsedSec
+                                        val pct = ((sentSoFar * 100) / totalSize).toInt().coerceAtMost(99)
+                                        onProgress(sentMB, totalMB, speed, pct)
+                                    }
                                 }
 
-                                remaining -= bytesRead
-                                currentOffset += bytesRead
-
-                                val sentSoFar = totalSent.addAndGet(bytesRead.toLong())
-                                val elapsedSec = ((System.currentTimeMillis() - startTime) / 1000.0).coerceAtLeast(0.1)
-                                val sentMB = sentSoFar / (1024.0 * 1024.0)
-                                val speed = sentMB / elapsedSec
-                                val pct = ((sentSoFar * 100) / totalSize).toInt().coerceAtMost(99)
-                                onProgress(sentMB, totalMB, speed, pct)
-                            }
-
-                            val ack = ByteBuffer.allocate(1)
-                            val ackRead = socketChannel.read(ack)
-                            if (ackRead != 1 || ack.get(0) != 1.toByte()) {
-                                throw Exception("Tablet did not confirm chunk #$index!")
+                                val ack = ByteBuffer.allocate(1)
+                                val ackRead = socketChannel.read(ack)
+                                if (ackRead != 1 || ack.get(0) != 1.toByte()) {
+                                    throw Exception("Tablet did not confirm chunk #$index!")
+                                }
                             }
                         }
                     }
+                    jobs.awaitAll()
                 }
-                jobs.awaitAll()
+            } finally {
+                try { pfd.close() } catch (_: Exception) {}
             }
-        } finally {
-            try { pfd.close() } catch (_: Exception) {}
-        }
 
-        if (totalSent.get() != totalSize) {
-            throw Exception("Incomplete send: ${totalSent.get()} / $totalSize")
+            val elapsedSec = ((System.currentTimeMillis() - startTime) / 1000.0).coerceAtLeast(0.05)
+            onProgress(totalMB, totalMB, totalMB / elapsedSec, 100)
+            tabletSavePath
+        } finally {
+            isTransferring = false
         }
-        val elapsedSec = ((System.currentTimeMillis() - startTime) / 1000.0).coerceAtLeast(0.1)
-        onProgress(totalMB, totalMB, totalMB / elapsedSec, 100)
-        tabletSavePath
     }
 
     suspend fun receiveFile(
@@ -141,88 +155,98 @@ object WarpEngine {
                     dataServer.socket().bind(InetSocketAddress(PORT_DATA))
 
                     val metaSocket = metaServer.accept()
-                    val input = DataInputStream(metaSocket.getInputStream())
-                    val out = DataOutputStream(metaSocket.getOutputStream())
-                    val fileName = input.readUTF()
-                    val totalSize = input.readLong()
-                    val totalMB = totalSize / (1024.0 * 1024.0)
-
-                    var outFile = File(primaryDir, fileName)
+                    isTransferring = true
                     try {
-                        if (!primaryDir.exists()) primaryDir.mkdirs()
-                        RandomAccessFile(outFile, "rw").use { it.setLength(totalSize) }
-                    } catch (_: Exception) {
-                        if (!fallbackDir.exists()) fallbackDir.mkdirs()
-                        outFile = File(fallbackDir, fileName)
-                        RandomAccessFile(outFile, "rw").use { it.setLength(totalSize) }
-                    }
+                        val input = DataInputStream(metaSocket.getInputStream())
+                        val out = DataOutputStream(metaSocket.getOutputStream())
+                        val fileName = input.readUTF()
+                        val totalSize = input.readLong()
+                        val totalMB = totalSize / (1024.0 * 1024.0)
 
-                    onStart(fileName, totalMB, outFile.absolutePath)
-                    out.writeUTF("READY:${outFile.absolutePath}")
-                    out.flush()
-                    metaSocket.close()
+                        var outFile = File(primaryDir, fileName)
+                        try {
+                            if (!primaryDir.exists()) primaryDir.mkdirs()
+                            RandomAccessFile(outFile, "rw").use { it.setLength(totalSize) }
+                        } catch (_: Exception) {
+                            if (!fallbackDir.exists()) fallbackDir.mkdirs()
+                            outFile = File(fallbackDir, fileName)
+                            RandomAccessFile(outFile, "rw").use { it.setLength(totalSize) }
+                        }
 
-                    val startTime = System.currentTimeMillis()
-                    val totalReceived = AtomicLong(0L)
+                        onStart(fileName, totalMB, outFile.absolutePath)
+                        out.writeUTF("READY:${outFile.absolutePath}")
+                        out.flush()
+                        metaSocket.close()
 
-                    RandomAccessFile(outFile, "rw").channel.use { sharedOutChannel ->
-                        val workers = (0 until PARALLEL_STREAMS).map {
-                            async(Dispatchers.IO) {
-                                dataServer.accept().use { clientChannel ->
-                                    clientChannel.configureBlocking(true)
-                                    clientChannel.socket().apply {
-                                        tcpNoDelay = true
-                                        receiveBufferSize = SOCKET_BUFFER_BYTES
-                                    }
+                        val startTime = System.currentTimeMillis()
+                        val totalReceived = AtomicLong(0L)
+                        val lastUiUpdate = AtomicLong(0L)
 
-                                    val header = ByteBuffer.allocate(16)
-                                    while (header.hasRemaining()) {
-                                        if (clientChannel.read(header) < 0) throw Exception("Stream closed")
-                                    }
-                                    header.flip()
-                                    val offset = header.long
-                                    val length = header.long
-
-                                    val buffer = ByteBuffer.allocateDirect(512 * 1024)
-                                    var remaining = length
-                                    var currentOffset = offset
-
-                                    while (remaining > 0) {
-                                        buffer.clear()
-                                        if (remaining < buffer.capacity()) {
-                                            buffer.limit(remaining.toInt())
+                        RandomAccessFile(outFile, "rw").channel.use { sharedOutChannel ->
+                            val workers = (0 until PARALLEL_STREAMS).map {
+                                async(Dispatchers.IO) {
+                                    dataServer.accept().use { clientChannel ->
+                                        clientChannel.configureBlocking(true)
+                                        clientChannel.socket().apply {
+                                            tcpNoDelay = true
+                                            receiveBufferSize = SOCKET_BUFFER_BYTES
+                                            trafficClass = 0x18
                                         }
-                                        val bytesRead = clientChannel.read(buffer)
-                                        if (bytesRead <= 0) throw Exception("Dropped with $remaining left")
 
-                                        buffer.flip()
-                                        while (buffer.hasRemaining()) {
-                                            val written = sharedOutChannel.write(buffer, currentOffset)
-                                            currentOffset += written
+                                        val header = ByteBuffer.allocate(16)
+                                        while (header.hasRemaining()) {
+                                            if (clientChannel.read(header) < 0) throw Exception("Stream closed")
                                         }
-                                        remaining -= bytesRead
+                                        header.flip()
+                                        val offset = header.long
+                                        val length = header.long
 
-                                        val recSoFar = totalReceived.addAndGet(bytesRead.toLong())
-                                        val elapsedSec = ((System.currentTimeMillis() - startTime) / 1000.0).coerceAtLeast(0.1)
-                                        val recMB = recSoFar / (1024.0 * 1024.0)
-                                        val speed = recMB / elapsedSec
-                                        val pct = ((recSoFar * 100) / totalSize).toInt()
-                                        onProgress(fileName, recMB, totalMB, speed, pct)
+                                        val buffer = ByteBuffer.allocateDirect(DIRECT_BUFFER_BYTES)
+                                        var remaining = length
+                                        var currentOffset = offset
+
+                                        while (remaining > 0) {
+                                            buffer.clear()
+                                            if (remaining < buffer.capacity()) {
+                                                buffer.limit(remaining.toInt())
+                                            }
+                                            val bytesRead = clientChannel.read(buffer)
+                                            if (bytesRead <= 0) throw Exception("Dropped with $remaining left")
+
+                                            buffer.flip()
+                                            while (buffer.hasRemaining()) {
+                                                val written = sharedOutChannel.write(buffer, currentOffset)
+                                                currentOffset += written
+                                            }
+                                            remaining -= bytesRead
+
+                                            val recSoFar = totalReceived.addAndGet(bytesRead.toLong())
+                                            val now = System.currentTimeMillis()
+                                            val prev = lastUiUpdate.get()
+                                            if (now - prev >= 150 && lastUiUpdate.compareAndSet(prev, now)) {
+                                                val elapsedSec = ((now - startTime) / 1000.0).coerceAtLeast(0.05)
+                                                val recMB = recSoFar / (1024.0 * 1024.0)
+                                                val speed = recMB / elapsedSec
+                                                val pct = ((recSoFar * 100) / totalSize).toInt()
+                                                onProgress(fileName, recMB, totalMB, speed, pct)
+                                            }
+                                        }
+
+                                        val ack = ByteBuffer.wrap(byteArrayOf(1))
+                                        while (ack.hasRemaining()) clientChannel.write(ack)
                                     }
-
-                                    val ack = ByteBuffer.wrap(byteArrayOf(1))
-                                    while (ack.hasRemaining()) clientChannel.write(ack)
                                 }
                             }
+                            workers.awaitAll()
                         }
-                        workers.awaitAll()
-                        sharedOutChannel.force(true)
-                    }
 
-                    if (totalReceived.get() != totalSize) {
-                        throw Exception("Incomplete receive")
+                        if (totalReceived.get() != totalSize) {
+                            throw Exception("Incomplete receive")
+                        }
+                        outFile
+                    } finally {
+                        isTransferring = false
                     }
-                    outFile
                 }
             }
         }
